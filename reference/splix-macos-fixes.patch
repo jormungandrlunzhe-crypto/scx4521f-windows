@@ -1,0 +1,2048 @@
+diff --git a/include/cache.h b/include/cache.h
+index 6098117..8e4c610 100644
+--- a/include/cache.h
++++ b/include/cache.h
+@@ -1,10 +1,10 @@
+ /*
+- * 	    cache.h                   (C) 2008, Aurélien Croc (AP²C)
++ * 	    cache.h                   (C) 2006-2008, Aurélien Croc (AP²C)
+  *
+  *  This program is free software; you can redistribute it and/or modify
+  *  it under the terms of the GNU General Public License as published by
+  *  the Free Software Foundation; version 2 of the License.
+- * 
++ *
+  *  This program is distributed in the hope that it will be useful,
+  *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+@@ -15,8 +15,12 @@
+  *  Free Software Foundation, Inc.,
+  *  51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+  *
+- *  $Id$
+- * 
++ *  Page cache shared by the compression threads (producers) and the
++ *  rendering thread (consumer). All state is protected by a single mutex.
++ *  In sequential mode producers block when they get more than CACHESIZE
++ *  pages ahead of the consumer, so memory use is bounded. The manual duplex
++ *  modes need the whole document, so pages beyond CACHESIZE are swapped to
++ *  files in $TMPDIR.
+  */
+ #ifndef _CACHE_H_
+ #define _CACHE_H_
+@@ -30,118 +34,58 @@ enum CachePolicy {
+     /** All pages are needed with page number increasing. */
+     EveryPagesIncreasing,
+     /** Only even pages are needed with page number decreasing. */
+-    EvenDecreasing, 
++    EvenDecreasing,
+     /** Only odd pages are needed with page number increasing. */
+     OddIncreasing,
+ };
+ 
+-
+ /**
+-  * Initialize the cache mechanism and load the cache controller thread.
++  * Initialize the cache mechanism.
+   * @return TRUE if the initialization succeed. Otherwise it returns FALSE.
+   */
+ extern bool initializeCache();
+ 
+ /**
+-  * Uninitialize the cache mechanism and unload the cache controller thread.
+-  * @return TRUE if the uninitialization succeed. Otherwise it returns FALSE.
++  * Release every page still held by the cache and remove swap files.
++  * @return TRUE if every registered page had been consumed.
+   */
+ extern bool uninitializeCache();
+ 
+-
+ /**
+-  * Extract the next page (depending on the curernt cache policy)
+-  * @return the instance of the page. Otherwise it returns NULL if no page are
+-  *         found.
++  * Extract the next page (depending on the current cache policy). Blocks
++  * until the page is available.
++  * @return the instance of the page, or NULL at the end of the document or
++  *         when the job has been cancelled.
+   */
+ extern Page* getNextPage();
+ 
+ /**
+-  * Register a new page in the cache.
++  * Register a new page in the cache. The cache takes ownership of the page.
++  * May block while the cache is full (sequential policy only).
+   * @param page the page instance to register in the cache
+   */
+ extern void registerPage(Page* page);
+ 
+ /**
+-  * Set the new cache policy.
++  * Set the cache policy. Must be called before any page is registered.
++  * EvenDecreasing starts manual duplex: even pages in decreasing order, then
++  * odd pages in increasing order.
+   * @param policy the new cache policy
+   */
+ extern void setCachePolicy(CachePolicy policy);
+ 
+ /**
+-  * Set the number of pages in the document.
+-  * @param nr the number of pages
++  * Mark the end of the document.
++  * @param nr the number of pages (may be 0)
+   */
+ extern void setNumberOfPages(unsigned long nr);
+ 
+-
+ /**
+-  * @brief This class represent a cache entry to store a page.
+-  * To preserve memory a swapping mechanism is present.
++  * Cancel the job: wake up every waiting thread, make getNextPage() return
++  * NULL and registerPage() drop its page. Safe to call more than once.
+   */
+-class CacheEntry {
+-    protected:
+-        Page*                   _page;
+-        CacheEntry*             _previous;
+-        CacheEntry*             _next;
+-        char*                   _tempFile;
++extern void cancelCache();
+ 
+-    public:
+-        /**
+-          * Initialize the cache entry instance.
+-          * @param page the page instance associated to this entry.
+-          */
+-        CacheEntry(Page* page);
+-        /**
+-          * Destroy the cache entry instance.
+-          */
+-        virtual ~CacheEntry();
+-
+-    public:
+-        /**
+-          * Set the next cache entry.
+-          * @param entry the next cache entry
+-          */
+-        void                    setNext(CacheEntry *entry) {_next = entry;}
+-        /**
+-          * Set the previous cache entry.
+-          * @param entry the previous cache entry
+-          */
+-        void                    setPrevious(CacheEntry *entry) 
+-                                    {_previous = entry;}
+-        /**
+-          * Swap the page instance on the disk.
+-          * @return TRUE if the page has been successfully swapped. Otherwise it
+-          *         returns FALSE.
+-          */
+-        bool                    swapToDisk();
+-        /**
+-          * Restore a previously swapped page into memory.
+-          * @return TRUE if the page has been successfully restored. Otherwise 
+-          *         it returns FALSE.
+-          */
+-        bool                    restoreIntoMemory();
+-
+-        /**
+-          * @return the page instance.
+-          */
+-        Page*                   page() const {return _page;}
+-        /**
+-          * @return the next instance.
+-          */
+-        CacheEntry*             next() const {return _next;}
+-        /**
+-          * @return the previous instance.
+-          */
+-        CacheEntry*             previous() const {return _previous;}
+-        /**
+-         * @return TRUE if the page is currently swapped on disk. Otherwise
+-         *         returns FALSE.
+-         */
+-        bool                    isSwapped() const 
+-                                    {return _tempFile ? true : false;}
+-};
+ #endif /* _CACHE_H_ */
+ 
+ /* vim: set expandtab tabstop=4 shiftwidth=4 smarttab tw=80 cin enc=utf8: */
+-
+diff --git a/include/document.h b/include/document.h
+index 9b4a5c3..5990a77 100644
+--- a/include/document.h
++++ b/include/document.h
+@@ -38,6 +38,7 @@ class Document
+         cups_raster_t*          _raster;
+         unsigned long           _currentPage;
+         bool                    _lastPage;
++        bool                    _error;
+ 
+     public:
+         /**
+@@ -74,6 +75,11 @@ class Document
+           */
+         unsigned long           numberOfPages() const 
+                                     {return _lastPage ? _currentPage - 1: 0;}
++        /**
++          * @return TRUE once the input could not be read completely (truncated
++          *         or invalid raster data). No more pages are returned then.
++          */
++        bool                    hadError() const {return _error;}
+ };
+ 
+ #endif /* _DOCUMENT_H_ */
+diff --git a/include/rendering.h b/include/rendering.h
+index 89464f7..6e5b7f4 100644
+--- a/include/rendering.h
++++ b/include/rendering.h
+@@ -31,6 +31,16 @@ class Request;
+   */
+ extern bool render(Request& request);
+ 
++/**
++  * Ask the running job to stop after the current page. Async-signal-safe.
++  */
++extern void requestJobCancel();
++
++/**
++  * @return TRUE once the job has been cancelled.
++  */
++extern bool isJobCancelled();
++
+ #endif /* _RENDERING_H_ */
+ 
+ /* vim: set expandtab tabstop=4 shiftwidth=4 smarttab tw=80 cin enc=utf8: */
+diff --git a/include/swapio.h b/include/swapio.h
+new file mode 100644
+index 0000000..4eeb6a9
+--- /dev/null
++++ b/include/swapio.h
+@@ -0,0 +1,48 @@
++/*
++ *          swapio.h
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; version 2 of the License.
++ *
++ *  Checked I/O for swapping pages to disk: every byte is written or read,
++ *  or the call reports failure (disk full, truncated swap file, ...).
++ */
++#ifndef _SWAPIO_H_
++#define _SWAPIO_H_
++
++#include <errno.h>
++#include <unistd.h>
++#include <stddef.h>
++
++inline bool swapWrite(int fd, const void *buffer, size_t size)
++{
++    const unsigned char *data = (const unsigned char *)buffer;
++    while (size) {
++        ssize_t n = write(fd, data, size);
++        if (n < 0 && errno == EINTR)
++            continue;
++        if (n <= 0)
++            return false;
++        data += n;
++        size -= (size_t)n;
++    }
++    return true;
++}
++
++inline bool swapRead(int fd, void *buffer, size_t size)
++{
++    unsigned char *data = (unsigned char *)buffer;
++    while (size) {
++        ssize_t n = read(fd, data, size);
++        if (n < 0 && errno == EINTR)
++            continue;
++        if (n <= 0)
++            return false;
++        data += n;
++        size -= (size_t)n;
++    }
++    return true;
++}
++
++#endif /* _SWAPIO_H_ */
+diff --git a/src/algo0x0e.cpp b/src/algo0x0e.cpp
+index 8efbe75..d0da2a1 100644
+--- a/src/algo0x0e.cpp
++++ b/src/algo0x0e.cpp
+@@ -74,9 +74,10 @@ inline void Algo0x0E::addLiteralSequence(
+         output[outputSize++] = data[position + w];
+     }
+ 
+-    /* Pad with required blanks. */
++    /* Pad with required blanks. (Upstream wrote these into the input
++       bitmap instead of the output stream, corrupting memory.) */
+     for(w=0;w<blanks;w++){
+-        data[outputSize++] = 0xff;
++        output[outputSize++] = 0xff;
+     }
+ }
+ 
+@@ -208,7 +209,9 @@ BandPlane * Algo0x0E::compress(const Request & request, unsigned char *data,
+     try {
+         /* Estimate a buffer size equal to 2-byte control header overhead +
+            maxWorkRb, times the bitmap height + up to 3-byte padding at end. */
+-        output = new unsigned char[ ( 2 + maxWorkRb ) * height + 3 ];
++        /* Worst case is 3 output bytes per input byte (a 1-byte literal plus
++           its 2-byte header), so size the buffer for that. */
++        output = new unsigned char[ ( 8 + 3 * maxWorkRb ) * height + 4 ];
+     } catch( std::bad_alloc & ){
+         /* Catch error if buffer creation fails. */
+         ERRORMSG(_("Could not allocate work buffer for encoding: 0xe"));
+diff --git a/src/band.cpp b/src/band.cpp
+index e8f7633..4670cf7 100644
+--- a/src/band.cpp
++++ b/src/band.cpp
+@@ -21,6 +21,7 @@
+ #include "band.h"
+ #include <unistd.h>
+ #include "errlog.h"
++#include "swapio.h"
+ #include "bandplane.h"
+ 
+ /*
+@@ -71,10 +72,11 @@ Band::~Band()
+  */
+ bool Band::swapToDisk(int fd)
+ {
+-    write(fd, &_bandNr, sizeof(_bandNr));
+-    write(fd, &_colors, sizeof(_colors));
+-    write(fd, &_width, sizeof(_width));
+-    write(fd, &_height, sizeof(_height));
++    if (!swapWrite(fd, &_bandNr, sizeof(_bandNr)) ||
++        !swapWrite(fd, &_colors, sizeof(_colors)) ||
++        !swapWrite(fd, &_width, sizeof(_width)) ||
++        !swapWrite(fd, &_height, sizeof(_height)))
++        return false;
+     for (unsigned int i=0; i < _colors; i++)
+         if (!_planes[i]->swapToDisk(fd))
+             return false;
+@@ -87,10 +89,14 @@ Band* Band::restoreIntoMemory(int fd)
+     Band* band;
+ 
+     band = new Band();
+-    read(fd, &band->_bandNr, sizeof(band->_bandNr));
+-    read(fd, &colors, sizeof(colors));
+-    read(fd, &band->_width, sizeof(band->_width));
+-    read(fd, &band->_height, sizeof(band->_height));
++    if (!swapRead(fd, &band->_bandNr, sizeof(band->_bandNr)) ||
++        !swapRead(fd, &colors, sizeof(colors)) ||
++        !swapRead(fd, &band->_width, sizeof(band->_width)) ||
++        !swapRead(fd, &band->_height, sizeof(band->_height)) ||
++        colors > 4) {
++        delete band;
++        return NULL;
++    }
+     for (unsigned int i=0; i < colors; i++) {
+         BandPlane *plane = BandPlane::restoreIntoMemory(fd);
+         if (!plane) {
+diff --git a/src/bandplane.cpp b/src/bandplane.cpp
+index 93bec11..de91eb2 100644
+--- a/src/bandplane.cpp
++++ b/src/bandplane.cpp
+@@ -19,6 +19,7 @@
+  * 
+  */
+ #include "bandplane.h"
++#include "swapio.h"
+ #include <unistd.h>
+ 
+ /*
+@@ -65,30 +66,36 @@ void BandPlane::setData(unsigned char *data, unsigned long size)
+  */
+ bool BandPlane::swapToDisk(int fd)
+ {
+-    write(fd, &_colorNr, sizeof(_colorNr));
+-    write(fd, &_size, sizeof(_size));
+-    write(fd, _data, _size);
+-    write(fd, &_checksum, sizeof(_checksum));
+-    write(fd, &_endian, sizeof(_endian));
+-    write(fd, &_compression, sizeof(_compression));
+-    return true;
++    return swapWrite(fd, &_colorNr, sizeof(_colorNr)) &&
++        swapWrite(fd, &_size, sizeof(_size)) &&
++        swapWrite(fd, _data, _size) &&
++        swapWrite(fd, &_checksum, sizeof(_checksum)) &&
++        swapWrite(fd, &_endian, sizeof(_endian)) &&
++        swapWrite(fd, &_compression, sizeof(_compression));
+ }
+ 
+ BandPlane* BandPlane::restoreIntoMemory(int fd)
+ {
+-    unsigned char* data;
++    // A compressed band is never larger than a few hundred KB.
++    const unsigned long maxSize = 16 * 1024 * 1024;
+     BandPlane* plane;
+ 
+     plane = new BandPlane();
+-    read(fd, &plane->_colorNr, sizeof(plane->_colorNr));
+-    read(fd, &plane->_size, sizeof(plane->_size));
+-    data = new unsigned char[plane->_size];
+-    read(fd, data, plane->_size);
+-    plane->_data = data;
+-    read(fd, &plane->_checksum, sizeof(plane->_checksum));
+-    read(fd, &plane->_endian, sizeof(plane->_endian));
+-    read(fd, &plane->_compression, sizeof(plane->_compression));
+-
++    if (!swapRead(fd, &plane->_colorNr, sizeof(plane->_colorNr)) ||
++        !swapRead(fd, &plane->_size, sizeof(plane->_size)) ||
++        plane->_size > maxSize) {
++        plane->_size = 0;
++        delete plane;
++        return NULL;
++    }
++    plane->_data = new unsigned char[plane->_size];
++    if (!swapRead(fd, plane->_data, plane->_size) ||
++        !swapRead(fd, &plane->_checksum, sizeof(plane->_checksum)) ||
++        !swapRead(fd, &plane->_endian, sizeof(plane->_endian)) ||
++        !swapRead(fd, &plane->_compression, sizeof(plane->_compression))) {
++        delete plane;
++        return NULL;
++    }
+     return plane;
+ }
+ 
+diff --git a/src/cache.cpp b/src/cache.cpp
+index d31b57f..0f4873e 100644
+--- a/src/cache.cpp
++++ b/src/cache.cpp
+@@ -1,10 +1,10 @@
+ /*
+- * 	    cache.cpp                 (C) 2008, Aurélien Croc (AP²C)
++ * 	    cache.cpp                 (C) 2006-2008, Aurélien Croc (AP²C)
+  *
+  *  This program is free software; you can redistribute it and/or modify
+  *  it under the terms of the GNU General Public License as published by
+  *  the Free Software Foundation; version 2 of the License.
+- * 
++ *
+  *  This program is distributed in the hope that it will be useful,
+  *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+@@ -15,588 +15,256 @@
+  *  Free Software Foundation, Inc.,
+  *  51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+  *
+- *  $Id$
+- * 
++ *  Rewritten for the macOS package: the original cache controller thread
++ *  accessed shared state without locks and could deadlock when pages were
++ *  swapped to disk faster than they were printed, and it never returned for
++ *  documents without pages.
+  */
+ #ifndef DISABLE_THREADS
++
+ #include "cache.h"
++#include <map>
++#include <mutex>
++#include <chrono>
++#include <string>
++#include <condition_variable>
+ #include <fcntl.h>
+ #include <stdlib.h>
+ #include <unistd.h>
+-#include <string.h>
+ #include <errno.h>
+ #include "page.h"
+ #include "errlog.h"
+-#include "semaphore.h"
+-
+-/*
+- * Variables internes
+- * Internal variables
+- */
+-// Cache controller thread variables
+-static CachePolicy _policy = EveryPagesIncreasing;
+-static bool _stopCacheControllerThread = false;
+-static pthread_t _cacheThread;
+-static Semaphore _work(0);
+-
+-// Page request variables
+-static unsigned long _lastPageRequested = 0, _pageRequested = 0;
+-static Semaphore _pageAvailable(0);
+-
+-// Document information
+-static unsigned long _numberOfPages = 0;
+-
+-// Cache variables
+-static CacheEntry *_waitingList=NULL, *_lastWaitingList=NULL;
+-static Semaphore _waitingListLock;
+-static unsigned long _maxPagesInTable = 0, _pagesInTable = 0;
+-static CacheEntry **_pages = NULL;
+-static Semaphore _pageTableLock;
+-
+-// Cache in memory variables
+-static CacheEntry *_inMemory = NULL, *_inMemoryLast = NULL;
+-static unsigned long _pagesInMemory = 0;
+ 
+-
+-
+-/*
+- * Contrôleur de cache (thread)
+- * Cache controller (thread)
+- */
+-static void __registerIntoCacheList(CacheEntry *entry, bool swapLast)
++namespace {
++
++struct Entry {
++    Page*       page;       // NULL while swapped to disk
++    std::string swapFile;
++};
++
++std::mutex                          _lock;
++std::condition_variable             _changed;
++std::map<unsigned long, Entry>      _pages;
++unsigned long                       _pagesInMemory = 0;
++CachePolicy                         _policy = EveryPagesIncreasing;
++bool                                _duplex = false;
++bool                                _finished = false;
++bool                                _cancelled = false;
++unsigned long                       _numberOfPages = 0;
++unsigned long                       _lastPageRequested = 0;
++
++// Waits are bounded so a cancellation flagged from a signal handler (which
++// cannot notify the condition variable) is noticed quickly.
++const std::chrono::milliseconds     _pollInterval(250);
++
++std::string _swapDirectory()
+ {
+-    unsigned long pageNr;
+-    CacheEntry *tmp=NULL;
+-
+-    if (!_inMemory) {
+-        entry->setNext(NULL);
+-        entry->setPrevious(NULL);
+-        _inMemory = entry;
+-        _inMemoryLast = entry;
+-        _pagesInMemory = 1;
+-        return;
+-    }
+-
+-    // Locate the previous cache entry
+-    pageNr = entry->page()->pageNr();
+-    switch (_policy) {
+-        case OddIncreasing:
+-        case EveryPagesIncreasing:
+-            tmp = _inMemoryLast;
+-            while (tmp && tmp->page()->pageNr() > pageNr)
+-                tmp = tmp->previous();
+-            break;
+-        case EvenDecreasing:
+-            if (pageNr % 2) {
+-                // Odd page
+-                tmp = _inMemoryLast;
+-                while (tmp) {
+-                    if (!(tmp->page()->pageNr() % 2) || tmp->page()->pageNr() < 
+-                        pageNr)
+-                        break;
+-                    tmp = tmp->previous();
+-                }
+-
+-            } else {
+-                // Even page
+-                tmp = _inMemory;
+-                while (tmp && !(tmp->page()->pageNr() % 2)) {
+-                    if (tmp->page()->pageNr() < pageNr)
+-                        break;
+-                    tmp = tmp->next();
+-                }
+-                tmp = tmp ? tmp->previous() : _inMemoryLast;
+-            }
+-            break;
+-    }
++    const char *dir = getenv("TMPDIR");
++    std::string path = dir && *dir ? dir : "/tmp";
++    if (path[path.size() - 1] != '/')
++        path += '/';
++    return path;
++}
+ 
+-    // Register the new entry
+-    if (swapLast && tmp == _inMemoryLast) {
+-        entry->swapToDisk();
+-        swapLast = false;
+-    } else {
+-        if  (!tmp) {
+-            entry->setPrevious(NULL);
+-            entry->setNext(_inMemory);
+-            _inMemory->setPrevious(entry);
+-            _inMemory = entry;
+-        } else {
+-            entry->setPrevious(tmp);
+-            entry->setNext(tmp->next());
+-            if (tmp->next())
+-                tmp->next()->setPrevious(entry);
+-            else
+-                _inMemoryLast = entry;
+-            tmp->setNext(entry);
+-        }
+-        if (!swapLast)
+-            _pagesInMemory++;
++// Called with _lock held.
++bool _swapOut(Entry& entry)
++{
++    std::string path = _swapDirectory() + "splix-pageXXXXXX";
++    int fd = mkstemp(&path[0]);
++    if (fd == -1) {
++        ERRORMSG(_("Cannot create a swap file in %s (%i). Keeping the page "
++            "in memory"), _swapDirectory().c_str(), errno);
++        return false;
+     }
+-
+-    // Swap to disk the last entry if needed
+-    if (swapLast) {
+-        tmp = _inMemoryLast;
+-        _inMemoryLast = tmp->previous();
+-        tmp->previous()->setNext(NULL);
+-        tmp->swapToDisk();
++    bool ok = entry.page->swapToDisk(fd);
++    if (close(fd))
++        ok = false;
++    if (!ok) {
++        unlink(path.c_str());
++        ERRORMSG(_("Cannot swap a page to disk. Keeping it in memory"));
++        return false;
+     }
++    delete entry.page;
++    entry.page = NULL;
++    entry.swapFile = path;
++    return true;
+ }
+ 
+-static void __manageMemoryCache(CacheEntry *entry)
++// Called with _lock held. Returns NULL if the page cannot be restored.
++Page* _swapIn(Entry& entry)
+ {
+-    _pageTableLock.lock();
+-
+-    // Append an entry
+-    if (entry) {
+-        __registerIntoCacheList(entry, _pagesInMemory >= CACHESIZE);
+-
+-    // Preload the best page
++    Page *page = NULL;
++    int fd = open(entry.swapFile.c_str(), O_RDONLY);
++    if (fd == -1) {
++        ERRORMSG(_("Cannot open swap file %s (%i)"), entry.swapFile.c_str(),
++            errno);
+     } else {
+-        unsigned int nr;
+-
+-        if (_inMemoryLast)
+-            nr = _inMemoryLast->page()->pageNr();
+-        else
+-            nr = _lastPageRequested;
+-
+-        switch (_policy) {
+-            case EveryPagesIncreasing:
+-                nr++;
+-                break;
+-            case OddIncreasing:
+-                if (nr % 2)
+-                    nr += 2;
+-                else if (nr > 2)
+-                    nr -= 2;
+-                else
+-                    nr = 1;
+-                break;
+-            case EvenDecreasing:
+-                if (nr == 2)
+-                    nr = 1;
+-                else
+-                    nr -= 2;
+-                break;
+-        }
+-        if (nr <= _maxPagesInTable && _pages[nr-1]) {
+-            if (_pages[nr-1]->isSwapped())
+-                _pages[nr-1]->restoreIntoMemory();
+-            _pages[nr-1]->setNext(NULL);
+-            _pages[nr-1]->setPrevious(_inMemoryLast);
+-            if (_inMemoryLast) {
+-                _inMemoryLast->setNext(_pages[nr-1]);
+-                _inMemoryLast = _pages[nr-1];
+-            } else {
+-                _inMemory = _pages[nr-1];
+-                _inMemoryLast = _pages[nr-1];
+-            }
+-            _pagesInMemory++;
+-            if (nr == _pageRequested)
+-                _pageAvailable++;
++        page = Page::restoreIntoMemory(fd);
++        close(fd);
++        if (!page) {
++            ERRORMSG(_("Cannot restore a page from %s"),
++                entry.swapFile.c_str());
+         }
+     }
+-    _pageTableLock.unlock();
++    unlink(entry.swapFile.c_str());
++    entry.swapFile.clear();
++    return page;
+ }
+ 
+-static void* _cacheControllerThread(void *_exitVar)
++// Called with _lock held. Number of the page getNextPage() must return next,
++// 0 if it is not known yet, or ULONG_MAX past the end of the document.
++unsigned long _nextPageNumber()
+ {
+-    bool *needToExit = (bool *)_exitVar;
+-    bool whatToDo = true;
+-
+-    DEBUGMSG(_("Cache controller thread loaded and is waiting for a job"));
+-    while (!(*needToExit)) {
+-        bool preloadPage = false;
+-
+-        // Waiting for a job
+-        _work--;
+-
+-#ifdef DUMP_CACHE
+-        if (_pagesInMemory) {
+-            CacheEntry *tmp = _inMemory;
+-
+-            fprintf(stderr, _("DEBUG: [34mCache dump: "));
+-            for (unsigned int i=0; i < _pagesInMemory && tmp; i++) {
+-                fprintf(stderr, "%lu ", tmp->page()->pageNr());
+-                tmp = tmp->next();
+-            }
+-            fprintf(stderr, "[0m\n");
+-        } else
+-            fprintf(stderr, _("DEBUG: [34mCache empty[0m\n"));
+-#endif /* DUMP_CACHE */
+-
+-        // Does the thread needs to exit?
+-        if (*needToExit)
+-            break;
+-
+-
+-        /*
+-         * Check what action to do
+-         */
+-        // Nothing?
+-        if (!_waitingList && (_pagesInMemory == CACHESIZE || 
+-            _pagesInMemory == _pagesInTable))
+-            continue;
+-        // new page to append and pages to preload?
+-        // Choose one action of them to do (and inverse the action to do at 
+-        // each loop)
+-        if (_waitingList && !(_pagesInMemory == CACHESIZE || 
+-            _pagesInMemory == _pagesInTable)) {
+-            preloadPage = whatToDo;
+-            whatToDo = ~whatToDo;
+-        // One of the two thing to do
+-        } else
+-            preloadPage = (_waitingList == NULL);
+-
+-        /*
+-         * Preload a page
+-         */
+-        if (preloadPage) {
+-            __manageMemoryCache(NULL);
+-
+-        /*
+-         * Store a page
+-         */
+-        } else {
+-            CacheEntry *entry;
+-
+-            // Get the cache entry to store
+-            {
+-                _waitingListLock.lock();
+-                entry = _waitingList;
+-                _waitingList = entry->next();
+-                if (_lastWaitingList == entry)
+-                    _lastWaitingList = NULL;
+-                _waitingListLock.unlock();
+-            }
+-
+-            // Store the entry in the page table
+-            {
+-                _pageTableLock.lock();
+-
+-                // Resize the page table if needed
+-                while (entry->page()->pageNr() > _maxPagesInTable) {
+-                    if (!_maxPagesInTable) {
+-                        _maxPagesInTable = CACHESIZE;
+-                        _pages = new CacheEntry*[_maxPagesInTable];
+-                        memset(_pages, 0, _maxPagesInTable * 
+-                            sizeof(CacheEntry*));
+-                    } else {
+-                        CacheEntry** tmp = new CacheEntry*[_maxPagesInTable*10];
+-                        memcpy(tmp, _pages, _maxPagesInTable *
+-                            sizeof(CacheEntry*));
+-                        memset(tmp + _maxPagesInTable, 0, _maxPagesInTable * 9 *
+-                            sizeof(CacheEntry*));
+-                        delete[] _pages;
+-                        _pages = tmp;
+-                        _maxPagesInTable *= 10;
+-                    }
+-                }
+-
+-                // Store the page in the table
+-                _pages[entry->page()->pageNr() - 1] = entry;
+-                _pageTableLock.unlock();
+-            }
+-            _pagesInTable++;
+-
+-            // Does the main thread needs this page?
+-            if (_pageRequested == entry->page()->pageNr()) {
+-                _pageTableLock.lock();
+-                entry->setNext(NULL);
+-                entry->setPrevious(NULL);
+-                _pageAvailable++;
+-                _pageTableLock.unlock();
+-
+-            // So check whether the page can be kept in memory or have to
+-            // be swapped on the disk
+-            } else 
+-                __manageMemoryCache(entry);
+-        }
++    const unsigned long end = (unsigned long)-1;
++    if (!_duplex)
++        return _lastPageRequested + 1;
++    // Manual duplex needs the page count first.
++    if (!_finished)
++        return 0;
++    if (_policy == EvenDecreasing) {
++        unsigned long nr = _lastPageRequested ? _lastPageRequested - 2 :
++            (_numberOfPages & ~1UL);
++        if (nr >= 2 && nr <= _numberOfPages)
++            return nr;
++        _policy = OddIncreasing;
++        _lastPageRequested = 0;
+     }
+-
+-    DEBUGMSG(_("Cache controller unloaded. See ya"));
+-    return NULL;
++    unsigned long nr = _lastPageRequested ? _lastPageRequested + 2 : 1;
++    return nr <= _numberOfPages ? nr : end;
+ }
+ 
++void _release(Entry& entry)
++{
++    delete entry.page;
++    if (!entry.swapFile.empty())
++        unlink(entry.swapFile.c_str());
++}
+ 
++} // namespace
+ 
+-/*
+- * Initialisation et clôture du cache
+- * Cache initialization and uninitialization
+- */
+ bool initializeCache()
+ {
+-    // Load the cache controller thread
+-    if (pthread_create(&_cacheThread, NULL, _cacheControllerThread, 
+-        (void *)&_stopCacheControllerThread)) {
+-        ERRORMSG(_("Cannot load the cache controller thread. Operation "
+-            "aborted."));
+-        return false;
+-    }
+-
+-    // Initialize the different cache variables
++    std::lock_guard<std::mutex> guard(_lock);
++    _pages.clear();
++    _pagesInMemory = 0;
++    _policy = EveryPagesIncreasing;
++    _duplex = _finished = _cancelled = false;
++    _numberOfPages = _lastPageRequested = 0;
+     return true;
+ }
+ 
+ bool uninitializeCache()
+ {
+-    void *threadResult;
+-    bool res = true;
+-
+-    // Stop the cache controller thread
+-    _stopCacheControllerThread = true;
+-    _work++;
+-    if (pthread_join(_cacheThread, &threadResult)) {
+-        ERRORMSG(_("An error occurred while waiting the end of the cache "
+-            "controller thread"));
+-        res = false;
+-    }
+- 
+-    // Check if all pages has been read. Otherwise free them
+-    for (unsigned long i=0; i < _maxPagesInTable; i++) {
+-        if (_pages[i]) {
+-            ERRORMSG(_("Cache: page %lu hasn't be used!"), i+1);
+-            delete _pages[i]->page();
+-            delete _pages[i];
+-        }
+-    }
+-    delete[] _pages;
+-
+-    return res;
+-}
+-
+-
+-
+-/*
+- * Enregistrement d'une page dans le cache
+- * Register a new page in the cache
+- */
+-void registerPage(Page* page)
+-{
+-    CacheEntry *entry;
+-    
+-    entry = new CacheEntry(page);
+-    {
+-        _waitingListLock.lock();
+-        if (_lastWaitingList) {
+-            _lastWaitingList->setNext(entry);
+-            _lastWaitingList = entry;
+-        } else {
+-            _waitingList = entry;
+-            _lastWaitingList = entry;
++    std::lock_guard<std::mutex> guard(_lock);
++    bool clean = true;
++    for (std::map<unsigned long, Entry>::iterator it = _pages.begin();
++        it != _pages.end(); ++it) {
++        if (!_cancelled) {
++            ERRORMSG(_("Cache: page %lu hasn't be used!"), it->first);
++            clean = false;
+         }
+-        _waitingListLock.unlock();
+-    }
+-    _work++;
+-}
+-
+-
+-
+-/*
+- * Extraction d'une page du cache
+- * Cache page extraction
+- */
+-Page* getNextPage()
+-{
+-    CacheEntry *entry = NULL;
+-    unsigned long nr=0;
+-    bool notUnregister = false;
+-    Page *page;
+-
+-    // Get the next page number
+-    switch (_policy) {
+-        case EveryPagesIncreasing:
+-            nr = _lastPageRequested + 1;
+-            break;
+-        case EvenDecreasing:
+-            if (_lastPageRequested > 2)
+-                nr = _lastPageRequested - 2;
+-            else {
+-                nr = 1;
+-                setCachePolicy(OddIncreasing);
+-            }
+-            break;
+-        case OddIncreasing:
+-            if (!_lastPageRequested)
+-                nr = 1;
+-            else
+-                nr = _lastPageRequested + 2;
+-            break;
++        _release(it->second);
+     }
+-
+-    DEBUGMSG(_("Next requested page : %lu (# pages into memory=%lu/%u)"), nr, 
+-        _pagesInMemory, CACHESIZE);
+-
+-    // Wait for the page
+-    while (nr && (!_numberOfPages || _numberOfPages >= nr)) {
+-        {
+-            _pageTableLock.lock();
+-            if (_maxPagesInTable >= nr && _pages[nr - 1] && 
+-                !_pages[nr - 1]->isSwapped()) {
+-                entry = _pages[nr - 1];
+-                _pages[nr - 1] = NULL;
+-                if (!entry->previous() && !entry->next() && entry != _inMemory)
+-                    notUnregister = true;
+-                if (entry->previous())
+-                    entry->previous()->setNext(entry->next());
+-                if (entry->next())
+-                    entry->next()->setPrevious(entry->previous());
+-                if (entry == _inMemory)
+-                    _inMemory = entry->next();
+-                if (entry == _inMemoryLast)
+-                    _inMemoryLast = NULL;
+-                _pageTableLock.unlock();
+-                break;
+-            } else if (_maxPagesInTable >= nr && _pages[nr - 1] && 
+-                _pages[nr - 1]->isSwapped())
+-                _work++;
+-            _pageRequested = nr;
+-            _pageTableLock.unlock();
+-        }
+-        _pageAvailable--;
+-    };
+-
+-    // Extract the page instance
+-    if (!entry)
+-        return NULL;
+-    _pagesInTable--;
+-    _lastPageRequested = nr;
+-    page = entry->page();
+-    delete entry;
+-
+-    // Preload a new page
+-    if (!notUnregister)
+-        _pagesInMemory--;
+-    _work++;
+-
+-    return page;
++    _pages.clear();
++    _pagesInMemory = 0;
++    return clean;
+ }
+ 
+-
+-
+-/*
+- * Modification de la politique de gestion du cache
+- * Update the cache policy
+- */
+ void setCachePolicy(CachePolicy policy)
+ {
++    std::lock_guard<std::mutex> guard(_lock);
+     _policy = policy;
+-
+-    // Initialize the lastPageRequested to get the next page number 
+-    if (policy == EveryPagesIncreasing || policy == OddIncreasing)
+-        _lastPageRequested = 0;
+-    else {
+-        while (!_numberOfPages)
+-            _pageAvailable--;
+-        _lastPageRequested = (_numberOfPages & ~0x1) + 2;
+-    }
++    _duplex = policy != EveryPagesIncreasing;
++    _lastPageRequested = 0;
+ }
+ 
+-
+-
+-/*
+- * Enregistrer le nombre de pages maximum
+- * Set the maximum number of pages
+- */
+ void setNumberOfPages(unsigned long nr)
+ {
+-    _numberOfPages = nr;
+-    _pageAvailable++;
++    std::lock_guard<std::mutex> guard(_lock);
++    if (!_finished || nr < _numberOfPages) {
++        _numberOfPages = nr;
++        _finished = true;
++    }
++    _changed.notify_all();
+ }
+ 
+-
+-
+-/*
+- * Gestion des entrées du cache
+- * Cache entry management
+- */
+-CacheEntry::CacheEntry(Page* page)
++void cancelCache()
+ {
+-    _tempFile = NULL;
+-    _next = NULL;
+-    _previous = NULL;
+-    _page = page;
++    std::lock_guard<std::mutex> guard(_lock);
++    _cancelled = true;
++    for (std::map<unsigned long, Entry>::iterator it = _pages.begin();
++        it != _pages.end(); ++it)
++        _release(it->second);
++    _pages.clear();
++    _pagesInMemory = 0;
++    _changed.notify_all();
+ }
+ 
+-CacheEntry::~CacheEntry()
+-{
+-    if (_tempFile) {
+-        ERRORMSG(_("Destroy a cache entry which is still swapped on disk."));
+-        unlink(_tempFile);
+-        delete[] _tempFile;
+-    }
+-}
++extern bool isJobCancelled();
+ 
+-bool CacheEntry::swapToDisk()
++void registerPage(Page* page)
+ {
+-    const char *path = "/tmp/splixV2-pageXXXXXX";
+-    int fd;
+-
+-    if (_tempFile) {
+-        ERRORMSG(_("Trying to swap a page instance on the disk which is "
+-            "already swapped."));
+-        return false;
+-    }
+-
+-    // Create the temporarily file
+-    _tempFile = new char[strlen(path)+1];
+-    strcpy(_tempFile, path);
+-    if ((fd = mkstemp(_tempFile)) == -1) {
+-        delete[] _tempFile;
+-        _tempFile = NULL;
+-        ERRORMSG(_("Cannot swap a page into disk (%i)"), errno);
+-        return false;
++    std::unique_lock<std::mutex> guard(_lock);
++    const unsigned long nr = page->pageNr();
++
++    // Sequential printing: don't get more than CACHESIZE pages ahead. The
++    // page the consumer waits for is always within the window, so this
++    // cannot deadlock.
++    while (!_duplex && !_cancelled && nr > _lastPageRequested + CACHESIZE) {
++        _changed.wait_for(guard, _pollInterval);
++        if (isJobCancelled())
++            _cancelled = true;
+     }
+-
+-    // Swap the instance into the file
+-    if (!_page->swapToDisk(fd)) {
+-        unlink(_tempFile);
+-        delete[] _tempFile;
+-        _tempFile = NULL;
+-        ERRORMSG(_("Cannot swap a page into disk"));
+-        return false;
++    if (_cancelled) {
++        delete page;
++        return;
+     }
+ 
+-    DEBUGMSG(_("Page %lu swapped to disk"), _page->pageNr());
+-    close(fd);
+-    delete _page;
+-    _page = NULL;
+-
+-    return true;
++    Entry entry;
++    entry.page = page;
++    if (_duplex && _pagesInMemory >= CACHESIZE && _swapOut(entry)) {
++        // Swapped out: nothing kept in memory.
++    } else
++        _pagesInMemory++;
++    _pages[nr] = entry;
++    _changed.notify_all();
+ }
+ 
+-bool CacheEntry::restoreIntoMemory()
++Page* getNextPage()
+ {
+-    int fd;
+-
+-    if (!_tempFile) {
+-        ERRORMSG(_("Trying to restore a page instance into memory which is "
+-            "already into memory"));
+-        return false;
+-    }
+-
+-    // Open the swap file
+-    if ((fd = open(_tempFile, O_RDONLY)) == -1) {
+-        ERRORMSG(_("Cannot restore page into memory (%i)"), errno);
+-        return false;
+-    }
+-
+-    // Restore the instance
+-    if (!(_page = Page::restoreIntoMemory(fd))) {
+-        ERRORMSG(_("Cannot restore page into memory"));
+-        return false;
++    std::unique_lock<std::mutex> guard(_lock);
++    while (true) {
++        if (_cancelled || isJobCancelled()) {
++            _cancelled = true;
++            return NULL;
++        }
++        unsigned long nr = _nextPageNumber();
++        if (nr == (unsigned long)-1)
++            return NULL;
++        if (nr) {
++            std::map<unsigned long, Entry>::iterator it = _pages.find(nr);
++            if (it != _pages.end()) {
++                Entry entry = it->second;
++                _pages.erase(it);
++                _lastPageRequested = nr;
++                _changed.notify_all();
++                if (entry.page) {
++                    _pagesInMemory--;
++                    return entry.page;
++                }
++                Page *page = _swapIn(entry);
++                if (page)
++                    return page;
++                // Unreadable swap file: skip that page, keep printing.
++                continue;
++            }
++            if (_finished && nr > _numberOfPages)
++                return NULL;
++        }
++        _changed.wait_for(guard, _pollInterval);
+     }
+-
+-    // Destroy the swap file
+-    close(fd);
+-    unlink(_tempFile);
+-    delete[] _tempFile;
+-    _tempFile = NULL;
+-
+-    DEBUGMSG(_("Page %lu restored into memory"), _page->pageNr());
+-    return true;
+ }
+ 
+ #endif /* DISABLE_THREADS */
+ 
+ /* vim: set expandtab tabstop=4 shiftwidth=4 smarttab tw=80 cin enc=utf8: */
+-
+diff --git a/src/compress.cpp b/src/compress.cpp
+index 762f77d..e248028 100644
+--- a/src/compress.cpp
++++ b/src/compress.cpp
+@@ -150,6 +150,11 @@ static bool _compressBandedPage(const Request& request, Page* page)
+     hardMarginY = ceil(page->convertToYResolution(request.printer()->
+         hardMarginY()));
+     hardMarginXInB = hardMarginX / 8;
++    if (hardMarginY >= page->height() ||
++        hardMarginXInB >= (page->width() + 7) / 8) {
++        ERRORMSG(_("Page is smaller than the printer's hardware margins"));
++        return false;
++    }
+     pageWidth = page->width();
+     pageHeight = page->height() - hardMarginY;
+     page->setWidth(pageWidth);
+@@ -158,6 +163,10 @@ static bool _compressBandedPage(const Request& request, Page* page)
+     bandHeight = request.printer()->bandHeight();
+     if (page->xResolution() == 300 && page->yResolution() == 300)
+         bandHeight /= 2;
++    if (!bandHeight) {
++        ERRORMSG(_("Invalid band height in the PPD file"));
++        return false;
++    }
+ 
+     //Patch for Samsung M2026
+     if (request.printer()->specialBandWidth()) {
+@@ -217,6 +226,8 @@ static bool _compressBandedPage(const Request& request, Page* page)
+                     break;
+                 default:
+                     ERRORMSG(_("Unknown compression algorithm. Aborted"));
++                    delete current;
++                    delete[] band;
+                     return false;
+             }
+ 
+@@ -235,7 +246,7 @@ static bool _compressBandedPage(const Request& request, Page* page)
+                         band[x + y * bandWidthInB] = planes[i][index + x + hardMarginXInB + y * lineWidthInB];
+                     }
+                     for (unsigned int x=lineWidthInB - hardMarginXInB; x < bandWidthInB; x++)
+-                        band[x + y * lineWidthInB]  = 0;
++                        band[x + y * bandWidthInB]  = 0;
+                 }
+             }
+ 
+diff --git a/src/document.cpp b/src/document.cpp
+index d5e3b77..9ff44d6 100644
+--- a/src/document.cpp
++++ b/src/document.cpp
+@@ -21,6 +21,7 @@
+ #include "document.h"
+ #include <fcntl.h>
+ #include <math.h>
++#include <new>
+ #include "page.h"
+ #include "errlog.h"
+ #include "request.h"
+@@ -32,6 +33,9 @@
+ Document::Document()
+ {
+     _raster = NULL;
++    _currentPage = 1;
++    _lastPage = false;
++    _error = false;
+ }
+ 
+ Document::~Document()
+@@ -66,15 +70,18 @@ bool Document::load(const Request& request)
+  */
+ Page* Document::getNextRawPage(const Request& request)
+ {
++    // Upper bounds for any page we accept: 1200 DPI on 20" x 40" media.
++    const unsigned long maxDim = 1200 * 40;
+     cups_page_header_t header;
+     unsigned long pageWidth, pageWidthInB, pageHeight, clippingX=0, clippingY=0;
+     unsigned long documentWidth, documentHeight, lineSize, planeSize, index=0;
+     unsigned long bytesToCopy, marginWidthInB=0, marginHeight=0;
+-    unsigned char *line, *planes[4];
++    unsigned long printHeight, rowsToCopy, rowsToSkipAfter;
++    unsigned char *line = NULL, *planes[4] = {NULL, NULL, NULL, NULL};
+     unsigned char colors;
++    double w, h;
+     Page *page;
+ 
+-    // Read the header
+     if (_lastPage)
+         return NULL;
+     if (!_raster) {
+@@ -88,22 +95,68 @@ Page* Document::getNextRawPage(const Request& request)
+         return NULL;
+     }
+ 
+-    // Make some calculations and store important data
++    // Validate the header before any size is derived from it.
++    if (header.cupsColorSpace == CUPS_CSPACE_K && header.cupsBitsPerColor == 1
++        && header.cupsBitsPerPixel == 1)
++        colors = 1;
++    else if (header.cupsColorSpace == CUPS_CSPACE_CMYK &&
++        header.cupsColorOrder == CUPS_ORDER_BANDED &&
++        header.cupsBitsPerColor == 1)
++        colors = 4;
++    else {
++        ERRORMSG(_("Unsupported raster format (color space %u, %u bits, "
++            "order %u)"), header.cupsColorSpace, header.cupsBitsPerPixel,
++            header.cupsColorOrder);
++        _lastPage = _error = true;
++        return NULL;
++    }
++    if ((header.HWResolution[0] != 300 && header.HWResolution[0] != 600 &&
++        header.HWResolution[0] != 1200) || (header.HWResolution[1] != 300 &&
++        header.HWResolution[1] != 600 && header.HWResolution[1] != 1200) ||
++        !header.cupsWidth || header.cupsWidth > maxDim ||
++        !header.cupsHeight || header.cupsHeight > maxDim ||
++        header.cupsBytesPerLine % colors ||
++        header.cupsBytesPerLine / colors < (header.cupsWidth + 7) / 8 ||
++        header.cupsBytesPerLine / colors > maxDim / 8) {
++        ERRORMSG(_("Invalid raster page header (%ux%u at %ux%u DPI, %u bytes "
++            "per line)"), header.cupsWidth, header.cupsHeight,
++            header.HWResolution[0], header.HWResolution[1],
++            header.cupsBytesPerLine);
++        _lastPage = _error = true;
++        return NULL;
++    }
++
+     page = new Page;
+     page->setXResolution(header.HWResolution[0]);
+     page->setYResolution(header.HWResolution[1]);
+-    colors = header.cupsColorSpace == CUPS_CSPACE_K ? 1 : 4;
+     documentWidth = (header.cupsWidth + 7) & ~7;
+     documentHeight = header.cupsHeight;
+     lineSize = header.cupsBytesPerLine / colors;
+-    pageWidth = ((unsigned long)ceil(page->convertToXResolution(request.
+-        printer()->pageWidth())) + 7) & ~7;
+-    pageHeight = ceil(page->convertToYResolution(request.printer()->
+-        pageHeight()));
+-    marginWidthInB =(ceil(page->convertToXResolution(header.Margins[0]))+7)/8; 
+-    marginHeight = ceil(page->convertToYResolution(header.Margins[1]));
+-    pageWidthInB = (pageWidth + 7) / 8;
++    w = ceil(page->convertToXResolution(request.printer()->pageWidth()));
++    h = ceil(page->convertToYResolution(request.printer()->pageHeight()));
++    if (!(w >= 8 && w <= maxDim && h >= 1 && h <= maxDim)) {
++        ERRORMSG(_("Invalid page size in the PPD file"));
++        delete page;
++        _lastPage = _error = true;
++        return NULL;
++    }
++    pageWidth = ((unsigned long)w + 7) & ~7;
++    pageHeight = (unsigned long)h;
++    pageWidthInB = pageWidth / 8;
+     planeSize = pageWidthInB * pageHeight;
++
++    // Margins come from the job; ignore any that leave no printable area.
++    if (header.Margins[0] < 72 * 20)
++        marginWidthInB = ((unsigned long)ceil(page->convertToXResolution(
++            header.Margins[0])) + 7) / 8;
++    if (header.Margins[1] < 72 * 40)
++        marginHeight = (unsigned long)ceil(page->convertToYResolution(
++            header.Margins[1]));
++    if (2 * marginWidthInB >= pageWidthInB)
++        marginWidthInB = 0;
++    if (2 * marginHeight >= pageHeight)
++        marginHeight = 0;
++
+     page->setWidth(pageWidth);
+     page->setHeight(pageHeight);
+     page->setColorsNr(colors);
+@@ -111,7 +164,7 @@ Page* Document::getNextRawPage(const Request& request)
+     page->setCompression(header.cupsCompression);
+     page->setCopiesNr(header.NumCopies);
+ 
+-    // Calculate clippings and margins
++    // Center the job on the page, clipping it where it is larger.
+     if (lineSize > pageWidthInB - 2 * marginWidthInB) {
+         clippingX = (lineSize - (pageWidthInB - 2 * marginWidthInB)) / 2;
+         bytesToCopy = pageWidthInB - 2 * marginWidthInB;
+@@ -120,87 +173,73 @@ Page* Document::getNextRawPage(const Request& request)
+         marginWidthInB = (pageWidthInB - lineSize) / 2;
+         bytesToCopy = lineSize;
+     }
+-
+-    if (documentHeight > pageHeight - 2 * marginHeight) {
+-        clippingY = (documentHeight - (pageHeight - 2 * marginHeight)) / 2;
++    printHeight = pageHeight - 2 * marginHeight;
++    if (documentHeight > printHeight) {
++        clippingY = (documentHeight - printHeight) / 2;
+         index = pageWidthInB * marginHeight;
++        rowsToCopy = printHeight;
+     } else {
+         clippingY = 0;
+-        index = pageWidthInB * ((pageHeight - documentHeight)/2);
++        index = pageWidthInB * ((pageHeight - documentHeight) / 2);
++        rowsToCopy = documentHeight;
+     }
+-    documentHeight -= clippingY;
+-    pageHeight -= 2*marginHeight;
+-    clippingY *= colors;
+-    line = new unsigned char[header.cupsBytesPerLine];
++    rowsToSkipAfter = documentHeight - clippingY - rowsToCopy;
++
+     DEBUGMSG(_("Document width=%lu height=%lu"), documentWidth, documentHeight);
+     DEBUGMSG(_("Page width=%lu (%lu) height=%lu"), pageWidth, pageWidthInB, pageHeight);
+     DEBUGMSG(_("Margin width in bytes=%lu height=%lu"), marginWidthInB, marginHeight);
+     DEBUGMSG(_("Clipping X=%lu Y=%lu"), clippingX, clippingY);
+     DEBUGMSG(_("Line size=%lu, Plane size=%lu, bytes to copy=%lu"), lineSize, planeSize, bytesToCopy);
+ 
+-    // Prepare planes and clip vertically the document if needed
+-    for (unsigned char i=0; i < colors; i++) {
+-        planes[i] = new unsigned char[planeSize];
++    line = new (std::nothrow) unsigned char[header.cupsBytesPerLine];
++    for (unsigned char i=0; line && i < colors; i++) {
++        planes[i] = new (std::nothrow) unsigned char[planeSize];
++        if (!planes[i])
++            break;
+         memset(planes[i], 0, planeSize);
+     }
+-    while (clippingY) {
+-        if (cupsRasterReadPixels(_raster, line, lineSize) < 1) {
+-            ERRORMSG(_("Cannot read pixel line"));
+-            for (unsigned int i=0; i < colors; i++)
+-                delete[] planes[i];
+-            delete[] line;
+-            delete page;
+-            return NULL;
+-        }
+-        clippingY--;
++    if (!line || !planes[colors - 1]) {
++        ERRORMSG(_("Not enough memory to load page %lu"), _currentPage);
++        goto error;
+     }
+ 
+-    // Load the bitmap
+-    while (pageHeight && documentHeight) {
++    // Skip the clipped rows on top, copy the visible ones, skip the rest.
++    for (unsigned long r=0; r < clippingY * colors; r++)
++        if (cupsRasterReadPixels(_raster, line, lineSize) < lineSize)
++            goto readError;
++    for (unsigned long r=0; r < rowsToCopy; r++) {
+         for (unsigned int i=0; i < colors; i++) {
+-            if (cupsRasterReadPixels(_raster, line, lineSize) < 1) {
+-                ERRORMSG(_("Cannot read pixel line"));
+-                for (unsigned int j=0; j < colors; j++)
+-                    delete[] planes[j];
+-                delete[] line;
+-                delete page;
+-                return NULL;
+-            }
+-            memcpy(planes[i] + index + marginWidthInB, line + clippingX, 
++            if (cupsRasterReadPixels(_raster, line, lineSize) < lineSize)
++                goto readError;
++            memcpy(planes[i] + index + marginWidthInB, line + clippingX,
+                 bytesToCopy);
+         }
+         index += pageWidthInB;
+-        pageHeight--;
+-        documentHeight--;
+     }
++    for (unsigned long r=0; r < rowsToSkipAfter * colors; r++)
++        if (cupsRasterReadPixels(_raster, line, lineSize) < lineSize)
++            goto readError;
+ 
+-    // Finish to clip vertically the document
+-    documentHeight *= colors;
+-    while (documentHeight) {
+-        if (cupsRasterReadPixels(_raster, line, lineSize) < 1) {
+-            ERRORMSG(_("Cannot read pixel line"));
+-            for (unsigned int j=0; j < colors; j++)
+-                delete[] planes[j];
+-            delete[] line;
+-            delete page;
+-            return NULL;
+-        }
+-        documentHeight--;
+-    }
+     _currentPage++;
+-
+     for (unsigned int i=0; i < colors; i++)
+         page->setPlaneBuffer(i, planes[i]);
+-
+     DEBUGMSG(_("Page %lu (%u×%u on %lu×%lu) has been successfully loaded into "
+         "memory"), page->pageNr(), header.cupsWidth, header.cupsHeight, 
+         page->width(), page->height());
+-
+     delete[] line;
+     return page;
+-}
+-
+ 
++readError:
++    ERRORMSG(_("Cannot read pixel line: the job data of page %lu is "
++        "truncated"), _currentPage);
++error:
++    for (unsigned int i=0; i < colors; i++)
++        delete[] planes[i];
++    delete[] line;
++    delete page;
++    _lastPage = _error = true;
++    return NULL;
++}
+ 
+ /* vim: set expandtab tabstop=4 shiftwidth=4 smarttab tw=80 cin enc=utf8: */
+ 
+diff --git a/src/page.cpp b/src/page.cpp
+index 3efb4f6..7408c2e 100644
+--- a/src/page.cpp
++++ b/src/page.cpp
+@@ -23,6 +23,7 @@
+ #include <string.h>
+ #include "band.h"
+ #include "errlog.h"
++#include "swapio.h"
+ 
+ /*
+  * This magic formula reverse the bit of a byte. ie. the bit 1 becomes the 
+@@ -131,20 +132,22 @@ bool Page::swapToDisk(int fd)
+             "representation"));
+         return false;
+     }
+-    write(fd, &_xResolution, sizeof(_xResolution));
+-    write(fd, &_yResolution, sizeof(_yResolution));
+-    write(fd, &_width, sizeof(_width));
+-    write(fd, &_height, sizeof(_height));
+-    write(fd, &_colors, sizeof(_colors));
+-    write(fd, &_pageNr, sizeof(_pageNr));
+-    write(fd, &_copiesNr, sizeof(_copiesNr));
+-    write(fd, &_compression, sizeof(_compression));
+-    write(fd, &_empty, sizeof(_empty));
+-    write(fd, &_bandsNr, sizeof(_bandsNr));
++    if (!swapWrite(fd, &_xResolution, sizeof(_xResolution)) ||
++        !swapWrite(fd, &_yResolution, sizeof(_yResolution)) ||
++        !swapWrite(fd, &_width, sizeof(_width)) ||
++        !swapWrite(fd, &_height, sizeof(_height)) ||
++        !swapWrite(fd, &_colors, sizeof(_colors)) ||
++        !swapWrite(fd, &_pageNr, sizeof(_pageNr)) ||
++        !swapWrite(fd, &_copiesNr, sizeof(_copiesNr)) ||
++        !swapWrite(fd, &_compression, sizeof(_compression)) ||
++        !swapWrite(fd, &_empty, sizeof(_empty)) ||
++        !swapWrite(fd, &_bandsNr, sizeof(_bandsNr)))
++        return false;
+     /* Carefully check if there is BIH data and compression type is 0x15,
+        before saving BIH data to file. */
+     if (( 0x15 == _compression ) && ( _bandsNr > 0 ) && ( NULL != _bih ))
+-        write(fd, _bih, 20);
++        if (!swapWrite(fd, _bih, 20))
++            return false;
+     for (i=0, band = _firstBand; i < _bandsNr; i++) {
+         if (!band->swapToDisk(fd))
+             return false;
+@@ -160,21 +163,27 @@ Page* Page::restoreIntoMemory(int fd)
+     Page* page;
+ 
+     page = new Page();
+-    read(fd, &page->_xResolution, sizeof(page->_xResolution));
+-    read(fd, &page->_yResolution, sizeof(page->_yResolution));
+-    read(fd, &page->_width, sizeof(page->_width));
+-    read(fd, &page->_height, sizeof(page->_height));
+-    read(fd, &page->_colors, sizeof(page->_colors));
+-    read(fd, &page->_pageNr, sizeof(page->_pageNr));
+-    read(fd, &page->_copiesNr, sizeof(page->_copiesNr));
+-    read(fd, &page->_compression, sizeof(page->_compression));
+-    read(fd, &page->_empty, sizeof(page->_empty));
+-    read(fd, &nr, sizeof(nr));
++    if (!swapRead(fd, &page->_xResolution, sizeof(page->_xResolution)) ||
++        !swapRead(fd, &page->_yResolution, sizeof(page->_yResolution)) ||
++        !swapRead(fd, &page->_width, sizeof(page->_width)) ||
++        !swapRead(fd, &page->_height, sizeof(page->_height)) ||
++        !swapRead(fd, &page->_colors, sizeof(page->_colors)) ||
++        !swapRead(fd, &page->_pageNr, sizeof(page->_pageNr)) ||
++        !swapRead(fd, &page->_copiesNr, sizeof(page->_copiesNr)) ||
++        !swapRead(fd, &page->_compression, sizeof(page->_compression)) ||
++        !swapRead(fd, &page->_empty, sizeof(page->_empty)) ||
++        !swapRead(fd, &nr, sizeof(nr))) {
++        delete page;
++        return NULL;
++    }
+     /* Check if compression type is 0x15 and that there is at least one
+        image band before reading BIH data. */
+     if (( 0x15 == page->_compression ) && ( nr > 0 )) {
+         unsigned char bih[20];
+-        read(fd, bih, 20);
++        if (!swapRead(fd, bih, 20)) {
++            delete page;
++            return NULL;
++        }
+         page->setBIH(bih);
+     }
+     for (unsigned int i=0; i < nr; i++) {
+diff --git a/src/printer.cpp b/src/printer.cpp
+index e05a765..969e67c 100644
+--- a/src/printer.cpp
++++ b/src/printer.cpp
+@@ -24,6 +24,30 @@
+ #include "errlog.h"
+ #include "request.h"
+ #include "ppdfile.h"
++#include <string>
++
++/*
++ * Make a job or user name safe inside a PJL quoted string: no quotes or
++ * control characters (which would end the string or the command), ASCII only,
++ * and at most 80 characters.
++ */
++static std::string _pjlString(const char *value)
++{
++    std::string out;
++    for (const char *p = value ? value : ""; *p && out.size() < 80; p++) {
++        unsigned char c = (unsigned char)*p;
++        if (c == '"')
++            out += '\'';
++        else if (c < 0x20 || c == 0x7f)
++            out += ' ';
++        else if (c > 0x7f)
++            out += '?';
++        else
++            out += (char)c;
++    }
++    return out;
++}
++
+ 
+ 
+ 
+@@ -200,16 +224,16 @@ bool Printer::sendPJLHeader(const Request& request,
+     printf("%s", _beginPJL);
+ 
+     if (0x15 == compression) {
+-        printf("@PJL COMMENT USERNAME=\"Username: %s\"\n", request.userName());
+-        printf("@PJL COMMENT DOCNAME=\"%s\"\n", request.jobTitle());
+-        printf("@PJL JOB NAME=\"%s\"\n", request.jobTitle());
++        printf("@PJL COMMENT USERNAME=\"Username: %s\"\n", _pjlString(request.userName()).c_str());
++        printf("@PJL COMMENT DOCNAME=\"%s\"\n", _pjlString(request.jobTitle()).c_str());
++        printf("@PJL JOB NAME=\"%s\"\n", _pjlString(request.jobTitle()).c_str());
+     }
+ 
+     // Information about the job
+     printf("@PJL DEFAULT SERVICEDATE=%04u%02u%02u\n", 1900+timeinfo->tm_year,
+         timeinfo->tm_mon+1, timeinfo->tm_mday);
+-    printf("@PJL SET USERNAME=\"%s\"\n", request.userName());
+-    printf("@PJL SET JOBNAME=\"%s\"\n", request.jobTitle());
++    printf("@PJL SET USERNAME=\"%s\"\n", _pjlString(request.userName()).c_str());
++    printf("@PJL SET JOBNAME=\"%s\"\n", _pjlString(request.jobTitle()).c_str());
+ 
+     if (0x15 == compression)
+         printf("@PJL SET MULTIBINMODE=%s\n", "PRINTERDEFAULT");
+diff --git a/src/qpdl.cpp b/src/qpdl.cpp
+index 035432f..677fb1a 100644
+--- a/src/qpdl.cpp
++++ b/src/qpdl.cpp
+@@ -30,6 +30,31 @@
+ #include "request.h"
+ #include "bandplane.h"
+ 
++#include <errno.h>
++#include <unistd.h>
++
++/*
++ * write() may send fewer bytes than asked (large buffers on a pipe, or when a
++ * signal arrives). Loop until everything is written; -1 on a real error.
++ */
++static ssize_t _writeAll(int fd, const void *buffer, size_t size)
++{
++    const unsigned char *data = (const unsigned char *)buffer;
++    size_t done = 0;
++
++    while (done < size) {
++        ssize_t n = write(fd, data + done, size - done);
++        if (n < 0) {
++            if (errno == EINTR)
++                continue;
++            return -1;
++        }
++        done += (size_t)n;
++    }
++    return (ssize_t)done;
++}
++
++
+ /* Support function for algorithm of type 0x15 printers. */
+ static bool _outputAuxRecords(const Page* page)
+ {
+@@ -40,13 +65,13 @@ static bool _outputAuxRecords(const Page* page)
+     if (!band)
+         return true;
+     // Output record type 0x13 and marker for record 0x14 .
+-    if (write(STDOUT_FILENO, (unsigned char*)&header, 16) == -1) {
++    if (_writeAll(STDOUT_FILENO, (unsigned char*)&header, 16) == -1) {
+         ERRORMSG(_("Error while sending data to the printer (%u)"), errno);
+         return false;
+     }
+     // Output BIH of JBIG data.
+     if (page->getBIH()) {
+-        if (write(STDOUT_FILENO, page->getBIH(), 20) == -1) {
++        if (_writeAll(STDOUT_FILENO, page->getBIH(), 20) == -1) {
+             ERRORMSG(_("Error while sending data to the printer (%u)"), errno);
+             return false;
+         }
+@@ -56,7 +81,7 @@ static bool _outputAuxRecords(const Page* page)
+     }
+     header[0] = 0; header[1] = 0; header[2] = 1;
+     header[3] = (band->width() >> 8) + 65;
+-    if (write(STDOUT_FILENO, (unsigned char*)&header, 4) == -1) {
++    if (_writeAll(STDOUT_FILENO, (unsigned char*)&header, 4) == -1) {
+         ERRORMSG(_("Error while sending data to the printer (%u)"), errno);
+         return false;
+     }
+@@ -105,12 +130,12 @@ static bool _renderJBIGBand(const Request& request, const Band* band, bool mono)
+         header[0x9] = dataSize >> 16;            // Data size 16 - 23
+         header[0xa] = dataSize >> 8;             // Data size 8 - 15
+         header[0xb] = dataSize;                  // Data size 0 - 7
+-        if (write(STDOUT_FILENO, (unsigned char*)&header, 0xc) == -1) {
++        if (_writeAll(STDOUT_FILENO, (unsigned char*)&header, 0xc) == -1) {
+             ERRORMSG(_("Error while sending data (%u)"), errno);
+             return false;
+         }
+         // Send the data
+-        if (write(STDOUT_FILENO, plane->data(), plane->dataSize()) == -1) {
++        if (_writeAll(STDOUT_FILENO, plane->data(), plane->dataSize()) == -1) {
+             ERRORMSG(_("Error while sending data (%u)"), errno);
+             return false;
+         }
+@@ -120,7 +145,7 @@ static bool _renderJBIGBand(const Request& request, const Band* band, bool mono)
+         header[1] = checkSum >> 16;              // Checksum 16 - 23
+         header[2] = checkSum >> 8;               // Checksum 8 - 15
+         header[3] = checkSum;                    // Checksum 0 - 7
+-        if (write(STDOUT_FILENO, (unsigned char*)&header, 4) == -1) {
++        if (_writeAll(STDOUT_FILENO, (unsigned char*)&header, 4) == -1) {
+             ERRORMSG(_("Error while sending data (%u)"), errno);
+             return false;
+         }
+@@ -202,7 +227,7 @@ static bool _renderBand(const Request& request, const Band* band, bool mono)
+         header[size+2] = dataSize >> 16;            // Data size 16 - 23
+         header[size+3] = dataSize >> 8;             // Data size 8 - 15
+         header[size+4] = dataSize;                  // Data size 0 - 7
+-        if (write(STDOUT_FILENO, (unsigned char*)&header, size+5) == -1) {
++        if (_writeAll(STDOUT_FILENO, (unsigned char*)&header, size+5) == -1) {
+             ERRORMSG(_("Error while sending data to the printer (%u)"), errno);
+             return false;
+         }
+@@ -294,7 +319,7 @@ static bool _renderBand(const Request& request, const Band* band, bool mono)
+             } else
+                 for (unsigned int j=0; j < 4; j++)
+                     checkSum += header[size - j - 1];
+-            if (write(STDOUT_FILENO, (unsigned char*)&header, size) == -1) {
++            if (_writeAll(STDOUT_FILENO, (unsigned char*)&header, size) == -1) {
+                 ERRORMSG(_("Error while sending data to the printer (%u)"),
+                     errno);
+                 return false;
+@@ -302,7 +327,7 @@ static bool _renderBand(const Request& request, const Band* band, bool mono)
+         }
+         
+         // Send the data
+-        if (write(STDOUT_FILENO, plane->data(), plane->dataSize()) == -1) {
++        if (_writeAll(STDOUT_FILENO, plane->data(), plane->dataSize()) == -1) {
+             ERRORMSG(_("Error while sending data to the printer (%u)"), errno);
+             return false;
+         }
+@@ -319,7 +344,7 @@ static bool _renderBand(const Request& request, const Band* band, bool mono)
+             header[4] = 0;
+             size++;
+         }
+-        if (write(STDOUT_FILENO, (unsigned char*)&header, size) == -1) {
++        if (_writeAll(STDOUT_FILENO, (unsigned char*)&header, size) == -1) {
+             ERRORMSG(_("Error while sending data to the printer (%u)"), errno);
+             return false;
+         }
+@@ -407,7 +432,7 @@ bool renderPage(const Request& request, Page* page, bool lastPage)
+     header[0xe] = request.printer()->qpdlVersion(); // QPDL Version
+     header[0xf] = request.printer()->unknownByte3();// Colorplanes
+     header[0x10] = page->xResolution() / 100;       // X Resolution
+-    if (write(STDOUT_FILENO, (unsigned char*)&header, 0x11) == -1) {
++    if (_writeAll(STDOUT_FILENO, (unsigned char*)&header, 0x11) == -1) {
+         ERRORMSG(_("Error while sending data to the printer (%u)"), errno);
+         return false;
+     }
+@@ -429,7 +454,7 @@ bool renderPage(const Request& request, Page* page, bool lastPage)
+     header[0x0] = 1;                                // Signature
+     header[0x1] = page->copiesNr() >> 8;            // Number of copies 8-15
+     header[0x2] = page->copiesNr();                 // Number of copies 0-7
+-    if (write(STDOUT_FILENO, (unsigned char*)&header, 0x3) == -1) {
++    if (_writeAll(STDOUT_FILENO, (unsigned char*)&header, 0x3) == -1) {
+         ERRORMSG(_("Error while sending data to the printer (%u)"), errno);
+         return false;
+     }
+diff --git a/src/rastertoqpdl.cpp b/src/rastertoqpdl.cpp
+index 076d148..0d88657 100644
+--- a/src/rastertoqpdl.cpp
++++ b/src/rastertoqpdl.cpp
+@@ -19,7 +19,10 @@
+  * 
+  */
+ #include <errno.h>
++#include <signal.h>
++#include <string.h>
+ #include <stdlib.h>
++#include <unistd.h>
+ #include <cups/ppd.h>
+ #include <cups/cups.h>
+ #include "cache.h"
+@@ -30,6 +33,13 @@
+ #include "rendering.h"
+ #include "options.h"
+ 
++static void _onSigterm(int)
++{
++    // CUPS sends SIGTERM when the job is cancelled. Finish the page being
++    // sent and end the job cleanly instead of leaving the printer mid-page.
++    requestJobCancel();
++}
++
+ int main(int argc, char **argv)
+ {
+     const char *jobid, *user, *title, *options, *ppdFile, *file;
+@@ -52,6 +62,13 @@ int main(int argc, char **argv)
+     copies = strtol(argv[4], (char **)NULL, 10);
+     ppdFile = getenv("PPD");
+ 
++    struct sigaction action;
++    memset(&action, 0, sizeof(action));
++    action.sa_handler = _onSigterm;
++    sigemptyset(&action.sa_mask);
++    action.sa_flags = SA_RESTART;
++    sigaction(SIGTERM, &action, NULL);
++
+ 
+     // Get more information on the SpliX environment (for debugging)
+     DEBUGMSG(_("SpliX filter V. %s by Aurélien Croc (AP²C)"), VERSION);
+@@ -81,7 +98,12 @@ int main(int argc, char **argv)
+ #endif /* DISABLE_THREADS */
+ 
+     // Render the request
+-    if (!render(request)) {
++    bool rendered = render(request);
++    if (isJobCancelled()) {
++        fflush(stdout);
++        _exit(0);
++    }
++    if (!rendered) {
+         // Omit thread handling functions or it will not compile
+         // when threads are disabled.
+ #ifndef DISABLE_THREADS
+diff --git a/src/rendering.cpp b/src/rendering.cpp
+index f49f06c..f319cd2 100644
+--- a/src/rendering.cpp
++++ b/src/rendering.cpp
+@@ -29,18 +29,33 @@
+ #include "compress.h"
+ #include "document.h"
+ 
++#include <atomic>
++#include <signal.h>
++
++static std::atomic<bool> _cancelRequested(false);
++
++// Set from the SIGTERM handler, so it must stay async-signal-safe.
++void requestJobCancel()
++{
++    _cancelRequested = true;
++}
++
++bool isJobCancelled()
++{
++    return _cancelRequested;
++}
++
+ #ifndef DISABLE_THREADS
++#include <mutex>
+ #include <pthread.h>
+-#include "semaphore.h"
+ 
+ static Document document;
+-static Semaphore _lock;
+-static bool _returnState=true;
++static std::mutex _documentLock;
++static std::atomic<bool> _returnState(true);
+ 
+ /*
+- * This function is executed by each compression thread
+- * It compress each page, page by page and store them
+- * into the cache
++ * Compression thread: reads raster pages in order and hands them, compressed,
++ * to the cache. Pages are numbered as they are read, under the document lock.
+  */
+ static void *_compressPage(void* data)
+ {
+@@ -49,29 +64,32 @@ static void *_compressPage(void* data)
+     Page* page;
+ 
+     rotateEvenPages = request->duplex() == Request::ManualLongEdge;
+-    do {
+-        // Load the page
++    while (!isJobCancelled()) {
++        unsigned long pages;
++        bool error;
++
+         {
+-            _lock.lock();
++            std::lock_guard<std::mutex> guard(_documentLock);
+             page = document.getNextRawPage(*request);
+-            _lock.unlock();
++            pages = document.numberOfPages();
++            error = document.hadError();
+         }
+         if (!page) {
+-            setNumberOfPages(document.numberOfPages());
++            if (error)
++                _returnState = false;
++            setNumberOfPages(pages);
+             break;
+         }
+ 
+         // Make rotation on even pages for ManualLongEdge duplex mode
+-        if (rotateEvenPages && !(page->pageNr() % 2)) {
++        if (rotateEvenPages && !(page->pageNr() % 2))
+             page->rotate();
+-        }
+ 
+         // Apply some colors optimizations
+ #ifndef DISABLE_BLACKOPTIM
+         applyBlackOptimization(page);
+ #endif /* DISABLE_BLACKOPTIM */
+ 
+-        // Compress the page
+         if (compressPage(*request, page)) {
+             DEBUGMSG(_("Page %lu has been compressed and is ready for "
+                 "rendering"), page->pageNr());
+@@ -82,42 +100,41 @@ static void *_compressPage(void* data)
+             _returnState = false;
+         }
+         registerPage(page);
+-    } while (page);
+-
++    }
+     DEBUGMSG(_("Compression thread: work done. See ya"));
+-
+     return NULL;
+ }
+ 
+ bool render(Request& request)
+ {
+-    bool manualDuplex=false, checkLastPage=false, lastPage=false;
++    bool manualDuplex, checkLastPage=false, lastPage=false;
+     pthread_t threads[THREADS];
++    unsigned int started = 0;
+     Page *page;
+ 
+-    // Load the document
+     if (!document.load(request)) {
+         ERRORMSG(_("Error while rendering the request. Check the previous "
+             "message"));
+         return false;
+     }
+ 
+-    // Load the compression threads
+-    for (unsigned int i=0; i < THREADS; i++) {
+-        if (pthread_create(&threads[i], NULL, _compressPage, (void*)&request)) {
++    // The policy must be set before the first page is registered.
++    manualDuplex = request.duplex() == Request::ManualLongEdge ||
++        request.duplex() == Request::ManualShortEdge;
++    if (manualDuplex)
++        setCachePolicy(EvenDecreasing);
++
++    for (; started < THREADS; started++) {
++        if (pthread_create(&threads[started], NULL, _compressPage,
++            (void*)&request)) {
+             ERRORMSG(_("Cannot load compression threads. Operation aborted."));
++            cancelCache();
++            for (unsigned int i=0; i < started; i++)
++                pthread_join(threads[i], NULL);
+             return false;
+         }
+     }
+ 
+-    // Prepare the manual duplex
+-    if (request.duplex() == Request::ManualLongEdge || 
+-        request.duplex() == Request::ManualShortEdge) {
+-            manualDuplex = true;
+-            setCachePolicy(EvenDecreasing);
+-    }
+-
+-    //Load the first page
+     /*
+      * NOTE: To prevent printer timeout, PJL header must be sent when the first
+      * page to render is available (which is very quickly for normal request but
+@@ -126,19 +143,22 @@ bool render(Request& request)
+     page = getNextPage();
+ 
+     // Prevent troubles if the last page is an odd page (in manual duplex mode)
+-    if (manualDuplex && document.numberOfPages() % 2)
++    unsigned long numberOfPages;
++    {
++        std::lock_guard<std::mutex> guard(_documentLock);
++        numberOfPages = document.numberOfPages();
++    }
++    if (manualDuplex && numberOfPages % 2)
+         checkLastPage = true;
+ 
+-    // Send the PJL Header
+     if (page)
+         request.printer()->sendPJLHeader(request, page->compression(),
+                              page->xResolution(), page->yResolution() );
+     else
+         request.printer()->sendPJLHeader(request, 0, 0, 0);
+ 
+-    // Render the whole document
+     while (page) {
+-        if (checkLastPage && document.numberOfPages() == page->pageNr())
++        if (checkLastPage && numberOfPages == page->pageNr())
+             lastPage = true;
+         if (!page->isEmpty()) {
+             if (!renderPage(request, page, lastPage)) {
+@@ -149,24 +169,27 @@ bool render(Request& request)
+             fprintf(stderr, "PAGE: %lu %lu\n", page->pageNr(), page->copiesNr());
+         }
+         delete page;
+-        page = getNextPage();
++        page = isJobCancelled() ? NULL : getNextPage();
+     }
+ 
+-    // Send the PJL footer
++    // Always end the job cleanly so the printer resets, even when cancelled.
+     request.printer()->sendPJLFooter(request);
+ 
+-    // Wait for threads to be finished
+-    for (unsigned int i=0; i < THREADS; i++) {
+-        void *result;
++    if (isJobCancelled()) {
++        // Don't wait for the compression threads: they may be blocked reading
++        // the job. The caller exits right away.
++        cancelCache();
++        ERRORMSG(_("Job cancelled"));
++        return false;
++    }
+ 
+-        if (pthread_join(threads[i], &result))
++    for (unsigned int i=0; i < started; i++) {
++        if (pthread_join(threads[i], NULL))
+             ERRORMSG(_("An error occurred while waiting the end of a thread"));
+     }
+-
+     return _returnState;
+ }
+ 
+-
+ #else /* DISABLE_THREADS */
+ 
+ bool render(Request& request)
