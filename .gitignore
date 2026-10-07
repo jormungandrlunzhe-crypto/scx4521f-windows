@@ -1,0 +1,14 @@
+# Local build outputs and intermediate test files
+*.exe
+*.pdb
+*.qpdl
+__pycache__/
+*.py[cod]
+bin/
+obj/
+artifacts/
+work/
+.vs/
+.vscode/
+.DS_Store
+Thumbs.db
