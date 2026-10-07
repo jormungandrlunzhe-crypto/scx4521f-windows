@@ -1,0 +1,2 @@
+0a7fecce7d6b2f98b93d64de3aa243302dd92450b3474c0b3b1f8ea6e380ae7e  SCX4521F-Windows-v0.3.zip
+a3227bb5d68732ff5a708eae487ece6ecc9c81e2b3b23cea9ab4605e70c09712  SCX4521F-source-v0.3.zip
