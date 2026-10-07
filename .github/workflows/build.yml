@@ -1,0 +1,29 @@
+name: Windows build
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build .NET Framework executables
+        shell: powershell
+        run: .\build.ps1
+      - name: Upload executable tools and matching sources
+        uses: actions/upload-artifact@v4
+        with:
+          name: SCX4521F-Windows-build
+          path: |
+            *.exe
+            *.md
+            LICENSE
+            *.ps1
+            *.cmd
+            src/
+            reference/
+            tests/
+          if-no-files-found: error
